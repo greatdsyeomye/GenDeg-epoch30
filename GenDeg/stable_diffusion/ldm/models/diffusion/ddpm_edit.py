@@ -27,6 +27,15 @@ from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianD
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
+from composite_condition import (
+    CompositeConditionConfig,
+    CompositeConditionEncoder,
+    GlobalStatsTokenConfig,
+    GlobalStatsTokenEncoder,
+    make_null_composite_condition,
+)
+from spatial_condition import SpatialConditionConfig, SpatialConditionEncoder
+from physical_prior import PhysicalPriorWeights, composite_physical_prior_loss
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -216,9 +225,13 @@ class DDPM(pl.LightningModule):
 
             if input_weight.size() != sd[input_key].size():
                 print(f"Manual init: {input_key}")
-                input_weight.zero_()
-                input_weight[:, :4, :, :].copy_(sd[input_key])
-                ignore_keys.append(input_key)
+                adapted_weight = input_weight.clone()
+                adapted_weight.zero_()
+                copied_channels = min(input_weight.size(1), sd[input_key].size(1))
+                adapted_weight[:, :copied_channels].copy_(
+                    sd[input_key][:, :copied_channels]
+                )
+                sd[input_key] = adapted_weight
 
         for k in keys:
             for ik in ignore_keys:
@@ -369,6 +382,15 @@ class DDPM(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss, loss_dict = self.shared_step(batch)
 
+        # Never allow a long unattended run to keep updating/logging after
+        # numerical divergence. AMP may skip an individual overflowing update,
+        # but a non-finite forward loss must still terminate the run visibly.
+        if not torch.isfinite(loss).all():
+            raise FloatingPointError(
+                f"Non-finite training loss at global_step={self.global_step}, "
+                f"batch_idx={batch_idx}"
+            )
+
         self.log_dict(loss_dict, prog_bar=True,
                       logger=True, on_step=True, on_epoch=True)
 
@@ -462,6 +484,35 @@ class LatentDiffusion(DDPM):
                  scale_factor=1.0,
                  scale_by_std=False,
                  load_ema=True,
+                 composite_condition_config=None,
+                 composite_condition_injection="append",
+                 factor_residual_only=False,
+                 global_stats_token_config=None,
+                 global_stats_injection="fused",
+                 spatial_condition_config=None,
+                 spatial_condition_injection="additive_latent",
+                 spatial_ablation_mode="both",
+                 disable_global_stats=False,
+                 disable_factor_stats=False,
+                 residual_diffusion=False,
+                 residual_rgb_weight=0.0,
+                 residual_edge_weight=0.0,
+                 residual_preservation_weight=0.0,
+                 preservation_threshold=0.04,
+                 composite_gate_reset=None,
+                 composite_condition_init_seed=None,
+                 factor_contrast_weight=0.0,
+                 factor_contrast_margin=0.01,
+                 physical_prior_weight=0.0,
+                 physical_aux_max_t=250,
+                 physical_loss_resolution=256,
+                 physical_visibility_floor=0.05,
+                 physical_low_weight=1.0,
+                 physical_haze_weight=1.0,
+                 physical_rain_weight=2.0,
+                 physical_snow_weight=1.0,
+                 physical_rain_snow_exclusion_weight=0.0,
+                 physical_structure_weight=0.0,
                  *args, **kwargs):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -488,6 +539,49 @@ class LatentDiffusion(DDPM):
         self.instantiate_first_stage(first_stage_config)
         self.instantiate_cond_stage(cond_stage_config)
         self.cond_stage_forward = cond_stage_forward
+        self.residual_diffusion = residual_diffusion
+        if composite_condition_injection not in {
+            "append", "additive", "pooled_residual"
+        }:
+            raise ValueError(
+                "composite_condition_injection must be 'append', 'additive', "
+                "or 'pooled_residual'"
+            )
+        self.composite_condition_injection = composite_condition_injection
+        self.factor_residual_only = bool(factor_residual_only)
+        if global_stats_injection not in {"fused", "append"}:
+            raise ValueError("global_stats_injection must be 'fused' or 'append'")
+        self.global_stats_injection = global_stats_injection
+        self.disable_global_stats = disable_global_stats
+        self.disable_factor_stats = disable_factor_stats
+        if spatial_condition_injection not in {"additive_latent", "concat_maps"}:
+            raise ValueError(
+                "spatial_condition_injection must be 'additive_latent' or 'concat_maps'"
+            )
+        self.spatial_condition_injection = spatial_condition_injection
+        self.spatial_ablation_mode = spatial_ablation_mode
+        self.residual_rgb_weight = residual_rgb_weight
+        self.residual_edge_weight = residual_edge_weight
+        self.residual_preservation_weight = residual_preservation_weight
+        self.preservation_threshold = preservation_threshold
+        self.factor_contrast_weight = float(factor_contrast_weight)
+        self.factor_contrast_margin = float(factor_contrast_margin)
+        self.physical_prior_weight = float(physical_prior_weight)
+        self.physical_aux_max_t = int(physical_aux_max_t)
+        self.physical_loss_resolution = int(physical_loss_resolution)
+        self.physical_visibility_floor = float(physical_visibility_floor)
+        self.physical_prior_weights = PhysicalPriorWeights(
+            low_light=float(physical_low_weight),
+            haze=float(physical_haze_weight),
+            rain=float(physical_rain_weight),
+            snow=float(physical_snow_weight),
+            rain_snow_exclusion=float(physical_rain_snow_exclusion_weight),
+            structure=float(physical_structure_weight),
+        )
+        if self.factor_contrast_weight > 0 and composite_condition_injection != "append":
+            raise ValueError("factor contrast requires append-style factor tokens")
+        if self.physical_loss_resolution <= 0 or self.physical_loss_resolution % 8:
+            raise ValueError("physical_loss_resolution must be a positive multiple of 8")
 
         # construct linear projection layer for concatenating image CLIP text embedding and mu sigma
         self.stats_proj = nn.Linear(129, 77) # Number of bins to 77
@@ -499,6 +593,49 @@ class LatentDiffusion(DDPM):
         nn.init.zeros_(list(self.cc_projection.parameters())[1])
         self.cc_projection.requires_grad_(True)
 
+        # Optional CompositeGenDeg extension.  Leaving the config unset keeps
+        # the original GenDeg conditioning and checkpoint behavior intact.
+        if composite_condition_config is not None:
+            composite_config = CompositeConditionConfig(
+                **dict(composite_condition_config)
+            )
+            if composite_condition_init_seed is None:
+                self.composite_condition_encoder = CompositeConditionEncoder(
+                    composite_config
+                )
+            else:
+                # Architecture variants can consume different amounts of RNG
+                # while constructing their U-Nets. Isolate the new factor
+                # encoder's initialization so matched ablations start with
+                # exactly the same factor-token weights.
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(int(composite_condition_init_seed))
+                    self.composite_condition_encoder = CompositeConditionEncoder(
+                        composite_config
+                    )
+        else:
+            self.composite_condition_encoder = None
+
+        if global_stats_token_config is not None:
+            global_stats_config = GlobalStatsTokenConfig(
+                **dict(global_stats_token_config)
+            )
+            self.global_stats_token_encoder = GlobalStatsTokenEncoder(
+                global_stats_config
+            )
+        else:
+            self.global_stats_token_encoder = None
+        if self.global_stats_injection == "append" and self.global_stats_token_encoder is None:
+            raise ValueError(
+                "append-style global stats require global_stats_token_config"
+            )
+
+        if spatial_condition_config is not None:
+            spatial_config = SpatialConditionConfig(**dict(spatial_condition_config))
+            self.spatial_condition_encoder = SpatialConditionEncoder(spatial_config)
+        else:
+            self.spatial_condition_encoder = None
+
         self.clip_denoised = False
         self.bbox_tokenizer = None
 
@@ -507,9 +644,61 @@ class LatentDiffusion(DDPM):
             self.init_from_ckpt(ckpt_path, ignore_keys)
             self.restarted_from_ckpt = True
 
+            if composite_gate_reset is not None:
+                encoder = self.composite_condition_encoder
+                if encoder is None or encoder.gate is None:
+                    raise ValueError(
+                        "composite_gate_reset requires a gated composite condition encoder"
+                    )
+                with torch.no_grad():
+                    encoder.gate.fill_(float(composite_gate_reset))
+                print(
+                    "Reset composite condition gate to "
+                    f"{float(composite_gate_reset):.6f} "
+                    f"(effective tanh={float(torch.tanh(encoder.gate)):.6f})"
+                )
+
             if self.use_ema and not load_ema:
                 self.model_ema = LitEma(self.model)
                 print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))}.")
+
+    def prepare_global_stats(self, stats):
+        """Remove global mu/sigma while retaining the legacy tensor shape."""
+        if not self.disable_global_stats:
+            return stats
+        null_stats = torch.zeros_like(stats)
+        null_stats[:, :, -1] = 1.0
+        return null_stats
+
+    def prepare_factor_condition(self, factor_condition):
+        """Keep factor identity but remove per-factor mu/sigma controls."""
+        prepared = {key: value for key, value in factor_condition.items()}
+        if self.disable_factor_stats:
+            prepared["stats"] = torch.zeros_like(prepared["stats"])
+            if "stats_mask" in prepared:
+                prepared["stats_mask"] = torch.zeros_like(prepared["stats_mask"])
+        return prepared
+
+    def build_spatial_condition(
+        self, clean_rgb, clean_latent_mode, factor_condition, spatial_mode=None
+    ):
+        """Return the clean latent plus a learned scene-adaptive condition."""
+        if self.spatial_condition_encoder is None:
+            return clean_latent_mode
+        if factor_condition is None or "active" not in factor_condition:
+            raise KeyError("Spatial conditioning requires c_factors.active")
+        delta = self.spatial_condition_encoder(
+            clean_rgb,
+            factor_condition["active"],
+            output_size=tuple(clean_latent_mode.shape[-2:]),
+            spatial_mode=spatial_mode or self.spatial_ablation_mode,
+            stats=factor_condition.get("stats"),
+            stats_mask=factor_condition.get("stats_mask"),
+        )
+        delta = delta.to(dtype=clean_latent_mode.dtype)
+        if self.spatial_condition_injection == "concat_maps":
+            return torch.cat((clean_latent_mode, delta), dim=1)
+        return clean_latent_mode + delta
 
     def make_cond_schedule(self, ):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
@@ -518,7 +707,7 @@ class LatentDiffusion(DDPM):
 
     @rank_zero_only
     @torch.no_grad()
-    def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
         # only for very first batch
         if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
             assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
@@ -645,7 +834,7 @@ class LatentDiffusion(DDPM):
         """
         :param x: img of size (bs, c, h, w)
         :return: n img crops of size (n, bs, c, kernel_size[0], kernel_size[1])
-        """
+                """
         bs, nc, h, w = x.shape
 
         # number of crops in image
@@ -694,6 +883,7 @@ class LatentDiffusion(DDPM):
         return fold, unfold, normalization, weighting
 
     @torch.no_grad()
+    # bs: 배치 사이즈, 사용할 이미지 개수 제한하는 값,bs=None이면 전체 배치를 그대로 사용
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None, uncond=0.05):
         x = super().get_input(batch, k)
@@ -702,17 +892,40 @@ class LatentDiffusion(DDPM):
 
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
-        z = self.get_first_stage_encoding(encoder_posterior).detach()
         cond_key = cond_key or self.cond_stage_key
-        xc = super().get_input(batch, cond_key)
-        stats = xc["c_stats"].to(memory_format=torch.contiguous_format).float()  ### Needed?
+        # Keep every conditioning field aligned with the selected target
+        # batch.  log_images requests only N examples from a larger training
+        # batch; slicing after encoding clean/factor conditions would produce
+        # e.g. 4 target latents and 8 clean latents.
+        # xc : 이미지 생성 방향을 제어하는 조건
+        # super()로 부모 클래스의 get_input()함수 호출, cond_key: 배치에서 conditioning 데이터를 가져올 때 사용하는 key
+        xc = dict(super().get_input(batch, cond_key)) # Diffusion 모델에 입력되는 Conditioning(조건)데이터를 담은 딕셔너리
+        selected_bs = x.shape[0]
+        xc["c_crossattn"] = xc["c_crossattn"][:selected_bs] # 조건 정보를 diffusion U-Net에 전달하는 방식
+        xc["c_concat"] = xc["c_concat"][:selected_bs]
+        xc["c_stats"] = xc["c_stats"][:selected_bs]
+        if "c_factors" in xc:
+            xc["c_factors"] = {
+                key: value[:selected_bs]
+                for key, value in xc["c_factors"].items()
+            }
 
-        if bs is not None:
-            xc["c_crossattn"] = xc["c_crossattn"][:bs]
-            xc["c_concat"] = xc["c_concat"][:bs]
+        clean_rgb = xc["c_concat"].to(self.device)
+        clean_posterior = self.encode_first_stage(clean_rgb)
+        clean_latent_mode = clean_posterior.mode().detach()
+        clean_latent_scaled = (self.scale_factor * clean_latent_mode).detach()
+        if self.residual_diffusion:
+            # Learn only the latent change caused by degradation. Modes avoid
+            # injecting independent VAE posterior noise into the difference.
+            target_latent_scaled = (
+                self.scale_factor * encoder_posterior.mode()
+            ).detach()
+            z = target_latent_scaled - clean_latent_scaled
+        else:
+            z = self.get_first_stage_encoding(encoder_posterior).detach()
+        stats = xc["c_stats"].to(memory_format=torch.contiguous_format).float()
+        stats = self.prepare_global_stats(stats)
 
-            # Get statistics
-            stats = xc["c_stats"][:bs]
         cond = {}
 
         # To support classifier-free guidance, randomly drop out only text conditioning 5%, only image conditioning 5%, and both 5%.
@@ -724,27 +937,154 @@ class LatentDiffusion(DDPM):
         with torch.enable_grad():
             # Conditioning
             null_prompt = self.get_learned_conditioning([""]).detach()
-            stats_projected = self.stats_proj(stats)
-            stats_reshaped = stats_projected.contiguous().transpose(1, 2)
             clip_text_emb = self.get_learned_conditioning(xc["c_crossattn"]).detach()
 
             # Get null prompt for mu and sigma
-            null_prompt_musigma = torch.zeros(stats_projected.size(0), 2, 129, device=x.device)
+            null_prompt_musigma = torch.zeros(
+                stats.size(0), 2, 129, device=x.device, dtype=stats.dtype
+            )
             null_prompt_musigma[:, :, -1] = 1.0
-            null_prompt_mu_sigma_proj = self.stats_proj(null_prompt_musigma)
-            null_prompt_mu_sigma_proj = null_prompt_mu_sigma_proj.contiguous().transpose(1, 2)
+            selected_text = torch.where(prompt_mask, null_prompt, clip_text_emb)
+            if self.global_stats_injection == "append":
+                # Preserve the official GenDeg text projection while moving
+                # global statistics into two explicit cross-attention slots.
+                zero_features = torch.zeros(
+                    selected_text.shape[0], selected_text.shape[1], 2,
+                    device=selected_text.device, dtype=selected_text.dtype,
+                )
+                cross_attention = self.cc_projection(
+                    torch.cat([selected_text, zero_features], dim=-1)
+                )
+                global_tokens = self.global_stats_token_encoder(stats)
+                null_global_tokens = self.global_stats_token_encoder(
+                    null_prompt_musigma
+                )
+                global_tokens = torch.where(
+                    prompt_mask, null_global_tokens, global_tokens
+                )
+                cross_attention = torch.cat(
+                    [cross_attention, global_tokens], dim=1
+                )
+            else:
+                stats_projected = self.stats_proj(stats)
+                stats_reshaped = stats_projected.contiguous().transpose(1, 2)
+                null_prompt_mu_sigma_proj = self.stats_proj(null_prompt_musigma)
+                null_prompt_mu_sigma_proj = (
+                    null_prompt_mu_sigma_proj.contiguous().transpose(1, 2)
+                )
+                cross_attention = self.cc_projection(
+                    torch.cat(
+                        [
+                            selected_text,
+                            torch.where(
+                                prompt_mask,
+                                null_prompt_mu_sigma_proj,
+                                stats_reshaped,
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                )
 
-            # Apply null prompt mask
-            cond["c_crossattn"] = [
-                self.cc_projection(torch.cat([torch.where(prompt_mask, null_prompt,
-                                                          clip_text_emb), torch.where(prompt_mask, null_prompt_mu_sigma_proj,
-                                                          stats_reshaped)], dim=-1))]
+            factor_condition = None
+            if "c_factors" in xc:
+                factor_condition = {
+                    key: value.to(x.device) for key, value in xc["c_factors"].items()
+                }
+                factor_condition = self.prepare_factor_condition(factor_condition)
+
+            if self.composite_condition_encoder is not None:
+                if "c_factors" not in xc:
+                    raise KeyError(
+                        "Composite conditioning is enabled, but edit.c_factors "
+                        "is missing from the batch."
+                    )
+                factor_tokens = self.composite_condition_encoder(
+                    **factor_condition
+                )
+                null_factor_condition = make_null_composite_condition(
+                    x.size(0),
+                    self.composite_condition_encoder.config,
+                    device=x.device,
+                )
+                null_factor_tokens = self.composite_condition_encoder(
+                    **null_factor_condition
+                )
+                if self.factor_contrast_weight <= 0:
+                    factor_mask = rearrange(
+                        torch.rand(x.size(0), device=x.device) < uncond,
+                        "n -> n 1 1",
+                    )
+                    factor_tokens = torch.where(
+                        factor_mask, null_factor_tokens, factor_tokens
+                    )
+                if self.composite_condition_injection in {
+                    "additive", "pooled_residual"
+                }:
+                    cross_attention = cross_attention + factor_tokens.mean(
+                        dim=1, keepdim=True
+                    )
+                    if self.composite_condition_injection == "pooled_residual":
+                        active_mask = factor_condition["active"].bool()
+                        if self.factor_contrast_weight <= 0:
+                            dropped = factor_mask.view(-1)
+                            active_mask = active_mask & ~dropped.unsqueeze(1)
+                        residual_tokens = factor_tokens * active_mask.unsqueeze(-1)
+                        cond["c_factor_crossattn"] = [residual_tokens]
+                        # The legacy custom gradient-checkpoint function marks
+                        # every explicit input as requiring gradients during
+                        # recomputation. Keep the binary mask in floating
+                        # dtype here and cast to bool only inside attention.
+                        cond["c_factor_mask"] = active_mask.to(factor_tokens)
+                else:
+                    cross_attention = torch.cat(
+                        [cross_attention, factor_tokens], dim=1
+                    )
+                    if self.factor_contrast_weight > 0:
+                        cond["_factor_null_tokens"] = null_factor_tokens.detach()
+
+            if (
+                self.global_stats_injection == "append"
+                and self.composite_condition_encoder is not None
+                and self.composite_condition_injection == "append"
+                and tuple(cross_attention.shape[1:]) != (83, 768)
+            ):
+                raise RuntimeError(
+                    "Expected [B, 83, 768] cross-attention context from "
+                    "77 text + 2 global + 4 factor tokens, got "
+                    f"{tuple(cross_attention.shape)}"
+                )
+
+            cond["c_crossattn"] = [cross_attention]
         # Mask for input clean image condition
-        cond["c_concat"] = [input_mask * self.encode_first_stage((xc["c_concat"].to(self.device))).mode().detach()]
+        # get_input is decorated with no_grad for the frozen VAE. Re-enable
+        # gradients only for the trainable spatial conditioner.
+        with torch.enable_grad():
+            spatial_clean_condition = self.build_spatial_condition(
+                clean_rgb, clean_latent_mode, factor_condition
+            )
+            # Keep this multiplication inside enable_grad as get_input itself
+            # is under no_grad for the frozen VAE.
+            masked_spatial_condition = input_mask * spatial_clean_condition
+        cond["c_concat"] = [masked_spatial_condition]
+        if self.physical_prior_weight > 0:
+            if factor_condition is None:
+                raise KeyError("physical prior requires c_factors")
+            cond["_physical_clean_rgb"] = clean_rgb.detach()
+            cond["_physical_target_rgb"] = x.detach()
+            cond["_physical_active"] = factor_condition["active"].detach()
+        if self.residual_diffusion:
+            # Private entries are consumed by p_losses and stripped before the
+            # conditioning dictionary reaches the UNet.
+            cond["_residual_clean_latent"] = clean_latent_scaled
+            cond["_residual_clean_rgb"] = clean_rgb.detach()
+            cond["_residual_target_rgb"] = x.detach()
 
         out = [z, cond]
         if return_first_stage_outputs:
-            xrec = self.decode_first_stage(z)
+            xrec = self.decode_first_stage(
+                clean_latent_scaled + z if self.residual_diffusion else z
+            )
             out.extend([x, xrec])
         if return_original_cond:
             out.append(xc)
@@ -940,7 +1280,7 @@ class LatentDiffusion(DDPM):
 
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
-            pass
+            cond = {key: value for key, value in cond.items() if not key.startswith("_")}
         else:
             if not isinstance(cond, list):
                 cond = [cond]
@@ -1089,6 +1429,128 @@ class LatentDiffusion(DDPM):
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
+
+        eligible = t <= self.physical_aux_max_t
+        if self.factor_contrast_weight > 0 and eligible.any():
+            factor_tokens = cond["_factor_null_tokens"]
+            conditioned_context = cond["c_crossattn"][0]
+            factor_count = factor_tokens.shape[1]
+            null_context = torch.cat(
+                (conditioned_context[:, :-factor_count], factor_tokens), dim=1
+            )
+            null_cond = {
+                "c_concat": cond["c_concat"],
+                "c_crossattn": [null_context],
+            }
+            null_output = self.apply_model(x_noisy, t, null_cond)
+            correct_error = self.get_loss(model_output, target, mean=False).mean((1, 2, 3))
+            null_error = self.get_loss(null_output, target, mean=False).mean((1, 2, 3))
+            contrast = torch.relu(
+                self.factor_contrast_margin
+                + correct_error[eligible]
+                - null_error[eligible].detach()
+            ).mean()
+            loss = loss + self.factor_contrast_weight * contrast
+            loss_dict[f'{prefix}/loss_factor_contrast'] = contrast.detach()
+            loss_dict[f'{prefix}/factor_null_error'] = null_error[eligible].mean().detach()
+
+        if self.physical_prior_weight > 0 and eligible.any():
+            if self.parameterization == "eps":
+                predicted_x0 = self.predict_start_from_noise(
+                    x_noisy[eligible], t=t[eligible], noise=model_output[eligible]
+                )
+            else:
+                predicted_x0 = model_output[eligible]
+            latent_size = self.physical_loss_resolution // 8
+            if predicted_x0.shape[-2:] != (latent_size, latent_size):
+                predicted_x0 = torch.nn.functional.interpolate(
+                    predicted_x0,
+                    size=(latent_size, latent_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            generated_rgb = self.differentiable_decode_first_stage(predicted_x0)
+            generated_rgb = (generated_rgb + 1.0) * 0.5
+            clean_rgb = (cond["_physical_clean_rgb"][eligible] + 1.0) * 0.5
+            target_rgb = (cond["_physical_target_rgb"][eligible] + 1.0) * 0.5
+            if clean_rgb.shape[-2:] != generated_rgb.shape[-2:]:
+                clean_rgb = torch.nn.functional.interpolate(
+                    clean_rgb, generated_rgb.shape[-2:], mode="area"
+                )
+                target_rgb = torch.nn.functional.interpolate(
+                    target_rgb, generated_rgb.shape[-2:], mode="area"
+                )
+            physical, physical_logs = composite_physical_prior_loss(
+                generated_rgb,
+                clean_rgb,
+                target_rgb,
+                cond["_physical_active"][eligible],
+                weights=self.physical_prior_weights,
+                visibility_floor=self.physical_visibility_floor,
+            )
+            loss = loss + self.physical_prior_weight * physical
+            loss_dict[f'{prefix}/loss_physical'] = physical.detach()
+            for name, value in physical_logs.items():
+                loss_dict[f'{prefix}/physical_{name}'] = value
+
+        if self.residual_diffusion and any(
+            weight > 0
+            for weight in (
+                self.residual_rgb_weight,
+                self.residual_edge_weight,
+                self.residual_preservation_weight,
+            )
+        ):
+            if self.parameterization == "eps":
+                residual_x0 = self.predict_start_from_noise(
+                    x_noisy, t=t, noise=model_output
+                )
+            else:
+                residual_x0 = model_output
+
+            clean_latent = cond["_residual_clean_latent"]
+            clean_rgb = cond["_residual_clean_rgb"]
+            target_rgb = cond["_residual_target_rgb"]
+            generated_rgb = self.differentiable_decode_first_stage(
+                clean_latent + residual_x0
+            )
+            with torch.no_grad():
+                reconstructed_clean = self.decode_first_stage(clean_latent)
+
+            # Cancelling the VAE reconstruction baseline makes zero residual
+            # an exact RGB identity at inference: x + D(z+dz) - D(z).
+            predicted_delta = generated_rgb - reconstructed_clean
+            target_delta = target_rgb - clean_rgb
+
+            rgb_loss = torch.abs(predicted_delta - target_delta).mean()
+            pred_dx = predicted_delta[..., :, 1:] - predicted_delta[..., :, :-1]
+            true_dx = target_delta[..., :, 1:] - target_delta[..., :, :-1]
+            pred_dy = predicted_delta[..., 1:, :] - predicted_delta[..., :-1, :]
+            true_dy = target_delta[..., 1:, :] - target_delta[..., :-1, :]
+            edge_loss = 0.5 * (
+                torch.abs(pred_dx - true_dx).mean()
+                + torch.abs(pred_dy - true_dy).mean()
+            )
+
+            change = target_delta.abs().mean(dim=1, keepdim=True)
+            unchanged = (change < self.preservation_threshold).to(predicted_delta)
+            preservation_loss = (
+                predicted_delta.abs() * unchanged
+            ).sum() / (unchanged.sum() * predicted_delta.shape[1] + 1e-6)
+
+            loss = (
+                loss
+                + self.residual_rgb_weight * rgb_loss
+                + self.residual_edge_weight * edge_loss
+                + self.residual_preservation_weight * preservation_loss
+            )
+            loss_dict.update(
+                {
+                    f'{prefix}/loss_residual_rgb': rgb_loss.detach(),
+                    f'{prefix}/loss_residual_edge': edge_loss.detach(),
+                    f'{prefix}/loss_preservation': preservation_loss.detach(),
+                }
+            )
         loss_dict.update({f'{prefix}/loss': loss})
 
         return loss, loss_dict
@@ -1301,7 +1763,10 @@ class LatentDiffusion(DDPM):
                    quantize_denoised=True, inpaint=False, plot_denoise_rows=False, plot_progressive_rows=False,
                    plot_diffusion_rows=False, **kwargs):
 
-        use_ddim = False
+        # Validation previews should use the requested accelerated DDIM
+        # schedule. The previous hard-coded ancestral sampler ignored
+        # ``ddim_steps`` and always performed all 1,000 diffusion steps.
+        use_ddim = ddim_steps is not None
 
         log = dict()
         z, c, x, xrec, xc = self.get_input(batch, self.first_stage_key,
@@ -1353,7 +1818,18 @@ class LatentDiffusion(DDPM):
                 samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
                                                          ddim_steps=ddim_steps,eta=ddim_eta)
                 # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
-            x_samples = self.decode_first_stage(samples)
+            if self.residual_diffusion:
+                clean_latent = c["_residual_clean_latent"][:N]
+                clean_rgb = c["_residual_clean_rgb"][:N]
+                degraded_reconstruction = self.decode_first_stage(
+                    clean_latent + samples
+                )
+                clean_reconstruction = self.decode_first_stage(clean_latent)
+                x_samples = (
+                    clean_rgb + degraded_reconstruction - clean_reconstruction
+                ).clamp(-1, 1)
+            else:
+                x_samples = self.decode_first_stage(samples)
             log["samples"] = x_samples
             if plot_denoise_rows:
                 denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
@@ -1410,6 +1886,33 @@ class LatentDiffusion(DDPM):
 
     def configure_optimizers(self):
         lr = self.learning_rate
+        if self.factor_residual_only:
+            for parameter in self.parameters():
+                parameter.requires_grad_(False)
+            factor_residual_parameters = []
+            for name, parameter in self.model.named_parameters():
+                if ".factor_attn." in name:
+                    parameter.requires_grad_(True)
+                    factor_residual_parameters.append(parameter)
+            if not factor_residual_parameters:
+                raise RuntimeError(
+                    "factor_residual_only=true but the U-Net has no factor_attn modules"
+                )
+            print(
+                "========== optimizing zero-init factor residual attention only "
+                f"({sum(p.numel() for p in factor_residual_parameters):,} parameters) =========="
+            )
+            opt = torch.optim.AdamW(factor_residual_parameters, lr=lr)
+            if self.use_scheduler:
+                scheduler = instantiate_from_config(self.scheduler_config)
+                scheduler = [{
+                    'scheduler': LambdaLR(opt, lr_lambda=scheduler.schedule),
+                    'interval': 'step',
+                    'frequency': 1,
+                }]
+                return [opt], scheduler
+            return opt
+
         params = list(self.model.parameters())
         if self.cond_stage_trainable:
             print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
@@ -1426,9 +1929,55 @@ class LatentDiffusion(DDPM):
             params = params + list(self.stats_proj.parameters())
             print('========== optimizing for stats projection weight ==========')
 
-        opt = torch.optim.AdamW([{"params": self.model.parameters(), "lr": lr},
-                                 {"params": self.cc_projection.parameters(), "lr": 10. * lr},
-                                 {"params": self.stats_proj.parameters(), "lr": 10. * lr}], lr=lr)
+        model_parameters = list(self.model.parameters())
+        parameter_groups = [
+            {"params": model_parameters, "lr": lr},
+            {"params": self.cc_projection.parameters(), "lr": 10. * lr},
+            {"params": self.stats_proj.parameters(), "lr": 10. * lr},
+        ]
+        if (
+            self.spatial_condition_encoder is not None
+            and self.spatial_condition_injection == "concat_maps"
+        ):
+            input_layer_parameters = list(
+                self.model.diffusion_model.input_blocks[0][0].parameters()
+            )
+            input_parameter_ids = {id(parameter) for parameter in input_layer_parameters}
+            parameter_groups[0]["params"] = [
+                parameter for parameter in model_parameters
+                if id(parameter) not in input_parameter_ids
+            ]
+            parameter_groups.append(
+                {"params": input_layer_parameters, "lr": 10. * lr}
+            )
+            print('========== optimizing spatial UNet input at 10x lr ==========')
+        if self.composite_condition_encoder is not None:
+            parameter_groups.append(
+                {
+                    "params": self.composite_condition_encoder.parameters(),
+                    "lr": 10. * lr,
+                }
+            )
+            print('========== optimizing composite condition encoder ==========')
+        if self.global_stats_token_encoder is not None:
+            parameter_groups.append(
+                {
+                    "params": self.global_stats_token_encoder.parameters(),
+                    "lr": 10. * lr,
+                }
+            )
+            print('========== optimizing global stats token encoder ==========')
+
+        if self.spatial_condition_encoder is not None:
+            parameter_groups.append(
+                {
+                    "params": self.spatial_condition_encoder.parameters(),
+                    "lr": 10. * lr,
+                }
+            )
+            print('========== optimizing spatial condition encoder ==========')
+
+        opt = torch.optim.AdamW(parameter_groups, lr=lr)
         
         # opt = torch.optim.AdamW(params, lr=lr)
         if self.use_scheduler:
@@ -1462,7 +2011,11 @@ class DiffusionWrapper(pl.LightningModule):
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm']
 
-    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None):
+    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None,
+                c_factor_crossattn: list = None, c_factor_mask=None):
+        factor_context = None
+        if c_factor_crossattn is not None:
+            factor_context = torch.cat(c_factor_crossattn, 1)
         if self.conditioning_key is None:
             out = self.diffusion_model(x, t)
         elif self.conditioning_key == 'concat':
@@ -1470,11 +2023,19 @@ class DiffusionWrapper(pl.LightningModule):
             out = self.diffusion_model(xc, t)
         elif self.conditioning_key == 'crossattn':
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(x, t, context=cc)
+            out = self.diffusion_model(
+                x, t, context=cc,
+                factor_context=factor_context,
+                factor_mask=c_factor_mask,
+            )
         elif self.conditioning_key == 'hybrid':
             xc = torch.cat([x] + c_concat, dim=1)
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(xc, t, context=cc)
+            out = self.diffusion_model(
+                xc, t, context=cc,
+                factor_context=factor_context,
+                factor_mask=c_factor_mask,
+            )
         elif self.conditioning_key == 'adm':
             cc = c_crossattn[0]
             out = self.diffusion_model(x, t, y=cc)

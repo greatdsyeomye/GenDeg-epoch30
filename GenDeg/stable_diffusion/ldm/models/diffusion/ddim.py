@@ -9,6 +9,23 @@ from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, mak
     extract_into_tensor
 
 
+def _conditioning_batch_size(conditioning):
+    """Return the batch size from nested LDM conditioning containers."""
+    if isinstance(conditioning, torch.Tensor):
+        return conditioning.shape[0]
+    if isinstance(conditioning, dict):
+        for value in conditioning.values():
+            batch_size = _conditioning_batch_size(value)
+            if batch_size is not None:
+                return batch_size
+    if isinstance(conditioning, (list, tuple)):
+        for value in conditioning:
+            batch_size = _conditioning_batch_size(value)
+            if batch_size is not None:
+                return batch_size
+    return None
+
+
 class DDIMSampler(object):
     def __init__(self, model, schedule="linear", **kwargs):
         super().__init__()
@@ -80,8 +97,10 @@ class DDIMSampler(object):
                ):
         if conditioning is not None:
             if isinstance(conditioning, dict):
-                cbs = conditioning[list(conditioning.keys())[0]].shape[0]
-                if cbs != batch_size:
+                # Hybrid LDM conditioning stores tensors inside lists, e.g.
+                # {"c_crossattn": [tensor], "c_concat": [tensor]}.
+                cbs = _conditioning_batch_size(conditioning)
+                if cbs is not None and cbs != batch_size:
                     print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
             else:
                 if conditioning.shape[0] != batch_size:

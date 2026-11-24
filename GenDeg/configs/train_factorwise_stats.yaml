@@ -1,0 +1,15 @@
+# Proposed factor-wise conditioning branch.  It adds only factor presence and
+# per-factor (mu, sigma), with an explicit validity mask.  No target-derived
+# handcrafted orientation, size, order, or subtype controls are consumed.
+model:
+  params:
+    composite_condition_config:
+      degradation_types: [low_light, haze, rain, snow]
+      parameter_dim: 2
+      hidden_dim: 256
+      context_dim: 768
+      num_subtypes: 5
+      stats_only: true
+      zero_gate: true
+    composite_condition_injection: additive
+    residual_diffusion: false

@@ -1,0 +1,117 @@
+# Shared paper-scale protocol for the global-stat baseline and factor-wise
+# model.  The physical corpus has 59,731 aligned pairs (approximately 50k):
+# 13,013 CDD-11 single/composite pairs plus 46,718 external pairs.
+model:
+  base_learning_rate: 1.0e-05
+  params:
+    ckpt_path: stable_diffusion/models/ldm/stable-diffusion-v1/v1-5-pruned-emaonly.ckpt
+    load_ema: false
+    monitor: null
+    residual_diffusion: false
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    # One GPU: 8 x 16 accumulation = effective batch 128.
+    batch_size: 8
+    num_workers: 4
+    train:
+      target: composite_dataset.CompositeDatasetMixture
+      params:
+        sampling: concat
+        datasets:
+          - target: composite_dataset.CDD11CompositeDataset
+            params:
+              root: data/cdd11/train
+              resolution: 256
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.0
+              # Keep text identical between baseline and proposal. Per-factor
+              # severity must enter only through the proposed numeric branch.
+              prompt_mode: atomic
+              categories: [low, haze, rain, snow, low_haze, low_rain, low_snow,
+                           haze_rain, haze_snow, low_haze_rain, low_haze_snow]
+          - target: composite_dataset.ManifestCompositeDataset
+            params:
+              manifest: data/manifests/allweathernight_train.jsonl
+              root: data/allweathernight
+              resolution: 256
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.0
+              dataset_name: allweathernight
+          - target: composite_dataset.ManifestCompositeDataset
+            params:
+              manifest: data/manifests/lcdd_train.jsonl
+              root: data/lcdd
+              resolution: 256
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.0
+              dataset_name: lcdd_reproduced
+          - target: composite_dataset.ManifestCompositeDataset
+            params:
+              manifest: data/manifests/weatherbench_train_4098.jsonl
+              root: data/weatherbench
+              resolution: 256
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.0
+              dataset_name: weatherbench
+          - target: composite_dataset.ManifestCompositeDataset
+            params:
+              manifest: data/manifests/llr_train.jsonl
+              root: data/llr
+              resolution: 256
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.0
+              dataset_name: llr
+    validation:
+      target: composite_dataset.CDD11CompositeDataset
+      params:
+        root: data/cdd11/test
+        resolution: 256
+        resize_mode: center_crop
+        flip_probability: 0.0
+        identity_probability: 0.0
+        prompt_mode: atomic
+        categories: [low_haze, low_rain, low_snow, haze_rain, haze_snow,
+                     low_haze_rain, low_haze_snow]
+        max_clean_images: 20
+
+lightning:
+  modelcheckpoint:
+    params:
+      # Keep only a resumable rolling checkpoint.  A checkpoint is about
+      # 7.7 GB, so retaining all 60 would exceed the available disk budget.
+      save_weights_only: false
+      save_last: true
+      save_top_k: 0
+      every_n_epochs: 1
+  callbacks:
+    image_logger:
+      params:
+        disabled: false
+        batch_frequency: 1000000000
+        max_images: 7
+        increase_log_steps: false
+        log_validation_every_n_epochs: 1
+        validation_seed: 23
+        log_images_kwargs:
+          N: 7
+          ddim_steps: 30
+          ddim_eta: 0.0
+  trainer:
+    gpus: "0"
+    precision: 16
+    max_steps: -1
+    max_epochs: 60
+    accumulate_grad_batches: 16
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    benchmark: true
+    check_val_every_n_epoch: 1
+    num_sanity_val_steps: 0
+    limit_val_batches: 1

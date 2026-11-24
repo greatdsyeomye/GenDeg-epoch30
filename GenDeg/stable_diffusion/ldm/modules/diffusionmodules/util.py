@@ -122,6 +122,12 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.run_function = run_function
         ctx.input_tensors = list(args[:length])
         ctx.input_params = list(args[length:])
+        # The original Stable Diffusion checkpoint implementation predates
+        # native AMP.  Preserve autocast state so recomputation in backward
+        # uses the same dtype as the forward pass.
+        ctx.autocast_enabled = torch.is_autocast_enabled()
+        ctx.autocast_dtype = torch.get_autocast_gpu_dtype()
+        ctx.autocast_cache_enabled = torch.is_autocast_cache_enabled()
 
         with torch.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
@@ -130,7 +136,11 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with torch.enable_grad():
+        with torch.enable_grad(), torch.cuda.amp.autocast(
+            enabled=ctx.autocast_enabled,
+            dtype=ctx.autocast_dtype,
+            cache_enabled=ctx.autocast_cache_enabled,
+        ):
             # Fixes a bug where the first op in run_function modifies the
             # Tensor storage in place, which is not allowed for detach()'d
             # Tensors.

@@ -208,23 +208,67 @@ class CrossAttention(nn.Module):
 
 
 class BasicTransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
+    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None,
+                 gated_ff=True, checkpoint=True, factor_residual_attention=False):
         super().__init__()
         self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
         self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
                                     heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
+        self.factor_attn = None
+        if factor_residual_attention:
+            self.factor_attn = CrossAttention(
+                query_dim=dim,
+                context_dim=context_dim,
+                heads=n_heads,
+                dim_head=d_head,
+                dropout=dropout,
+            )
+            # The separate factor branch must be an exact no-op when it is
+            # introduced on top of a trained pooled checkpoint.
+            nn.init.zeros_(self.factor_attn.to_out[0].weight)
+            nn.init.zeros_(self.factor_attn.to_out[0].bias)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
-    def forward(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+    def forward(self, x, context=None, factor_context=None, factor_mask=None):
+        if factor_context is None:
+            return checkpoint(
+                self._forward, (x, context), self.parameters(), self.checkpoint
+            )
+        if self.factor_attn is None:
+            raise RuntimeError("factor_context was provided without factor residual attention")
+        return checkpoint(
+            self._forward_factor,
+            (x, context, factor_context, factor_mask),
+            self.parameters(),
+            self.checkpoint,
+        )
 
     def _forward(self, x, context=None):
         x = self.attn1(self.norm1(x)) + x
         x = self.attn2(self.norm2(x), context=context) + x
+        x = self.ff(self.norm3(x)) + x
+        return x
+
+    def _forward_factor(self, x, context, factor_context, factor_mask):
+        x = self.attn1(self.norm1(x)) + x
+        normalized = self.norm2(x)
+        x = self.attn2(normalized, context=context) + x
+        has_active_factor = factor_mask.any(dim=1)
+        safe_factor_mask = factor_mask.bool().clone()
+        safe_factor_mask[~has_active_factor, 0] = True
+        factor_delta = self.factor_attn(
+            normalized,
+            context=factor_context,
+            mask=safe_factor_mask,
+        )
+        # Identity samples use one safe, zero-valued padding token to avoid an
+        # all-masked softmax.  Keep the residual exactly zero for those rows.
+        active_scale = has_active_factor.to(factor_delta).view(-1, 1, 1)
+        x = x + active_scale * factor_delta
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -238,7 +282,8 @@ class SpatialTransformer(nn.Module):
     Finally, reshape to image
     """
     def __init__(self, in_channels, n_heads, d_head,
-                 depth=1, dropout=0., context_dim=None):
+                 depth=1, dropout=0., context_dim=None,
+                 factor_residual_attention=False, checkpoint=True):
         super().__init__()
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
@@ -251,7 +296,15 @@ class SpatialTransformer(nn.Module):
                                  padding=0)
 
         self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim)
+            [BasicTransformerBlock(
+                inner_dim,
+                n_heads,
+                d_head,
+                dropout=dropout,
+                context_dim=context_dim,
+                checkpoint=checkpoint,
+                factor_residual_attention=factor_residual_attention,
+            )
                 for d in range(depth)]
         )
 
@@ -261,7 +314,7 @@ class SpatialTransformer(nn.Module):
                                               stride=1,
                                               padding=0))
 
-    def forward(self, x, context=None):
+    def forward(self, x, context=None, factor_context=None, factor_mask=None):
         # note: if no context is given, cross-attention defaults to self-attention
         b, c, h, w = x.shape
         x_in = x
@@ -269,7 +322,12 @@ class SpatialTransformer(nn.Module):
         x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
         for block in self.transformer_blocks:
-            x = block(x, context=context)
+            x = block(
+                x,
+                context=context,
+                factor_context=factor_context,
+                factor_mask=factor_mask,
+            )
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         x = self.proj_out(x)
         return x + x_in

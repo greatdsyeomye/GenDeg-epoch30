@@ -77,12 +77,17 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None):
+    def forward(self, x, emb, context=None, factor_context=None, factor_mask=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
+                x = layer(
+                    x,
+                    context,
+                    factor_context=factor_context,
+                    factor_mask=factor_mask,
+                )
             else:
                 x = layer(x)
         return x
@@ -464,6 +469,7 @@ class UNetModel(nn.Module):
         use_spatial_transformer=False,    # custom transformer support
         transformer_depth=1,              # custom transformer support
         context_dim=None,                 # custom transformer support
+        factor_residual_attention=False,  # zero-init factor-only cross-attention
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
         legacy=True,
     ):
@@ -555,7 +561,10 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, depth=transformer_depth,
+                            context_dim=context_dim,
+                            factor_residual_attention=factor_residual_attention,
+                            checkpoint=use_checkpoint,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -610,7 +619,10 @@ class UNetModel(nn.Module):
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
             ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, depth=transformer_depth,
+                            context_dim=context_dim,
+                            factor_residual_attention=factor_residual_attention,
+                            checkpoint=use_checkpoint,
                         ),
             ResBlock(
                 ch,
@@ -656,7 +668,10 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, depth=transformer_depth,
+                            context_dim=context_dim,
+                            factor_residual_attention=factor_residual_attention,
+                            checkpoint=use_checkpoint,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -707,7 +722,8 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None,
+                factor_context=None, factor_mask=None, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -729,12 +745,12 @@ class UNetModel(nn.Module):
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb, context)
+            h = module(h, emb, context, factor_context, factor_mask)
             hs.append(h)
-        h = self.middle_block(h, emb, context)
+        h = self.middle_block(h, emb, context, factor_context, factor_mask)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context)
+            h = module(h, emb, context, factor_context, factor_mask)
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
             return self.id_predictor(h)

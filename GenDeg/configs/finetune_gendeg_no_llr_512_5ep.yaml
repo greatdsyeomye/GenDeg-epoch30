@@ -1,0 +1,113 @@
+# Independent 512px composite-degradation fine-tune initialized from the
+# official GenDeg checkpoint. LLR is excluded because its targets contain
+# rectangular illumination artifacts.
+model:
+  base_learning_rate: 1.0e-06
+  params:
+    ckpt_path: gendeg.ckpt
+    load_ema: false
+    residual_diffusion: false
+
+data:
+  params:
+    # 512px training is run at batch 1. Accumulation 128 keeps the same
+    # effective optimizer batch (128) as the epoch-29 experiment.
+    batch_size: 1
+    num_workers: 2
+    train:
+      target: composite_dataset.CompositeDatasetMixture
+      params:
+        sampling: weighted
+        epoch_size: 51363
+        seed: 29
+        weights: [3549, 11830, 5915, 8000, 26252, 4098]
+        datasets:
+          - target: composite_dataset.CDD11CompositeDataset
+            params:
+              root: data/cdd11/train
+              resolution: 512
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.05
+              prompt_mode: atomic
+              categories: [low]
+          - target: composite_dataset.CDD11CompositeDataset
+            params:
+              root: data/cdd11/train
+              resolution: 512
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.05
+              prompt_mode: atomic
+              categories: [low_haze, low_rain, low_snow,
+                           low_haze_rain, low_haze_snow]
+          - target: composite_dataset.CDD11CompositeDataset
+            params:
+              root: data/cdd11/train
+              resolution: 512
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.05
+              prompt_mode: atomic
+              categories: [haze, rain, snow, haze_rain, haze_snow]
+          - target: composite_dataset.ManifestCompositeDataset
+            params:
+              manifest: data/manifests/allweathernight_train.jsonl
+              root: data/allweathernight
+              resolution: 512
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.05
+              dataset_name: allweathernight
+          - target: composite_dataset.ManifestCompositeDataset
+            params:
+              manifest: data/manifests/lcdd_train.jsonl
+              root: data/lcdd
+              resolution: 512
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.05
+              dataset_name: lcdd_reproduced
+          - target: composite_dataset.ManifestCompositeDataset
+            params:
+              manifest: data/manifests/weatherbench_train_4098.jsonl
+              root: data/weatherbench
+              resolution: 512
+              resize_mode: center_crop
+              flip_probability: 0.5
+              identity_probability: 0.05
+              dataset_name: weatherbench
+    validation:
+      target: composite_dataset.CDD11CompositeDataset
+      params:
+        root: data/cdd11/test
+        resolution: 512
+        resize_mode: center_crop
+        flip_probability: 0.0
+        identity_probability: 0.0
+        prompt_mode: atomic
+        categories: [low_haze, low_rain, low_snow, haze_rain, haze_snow,
+                     low_haze_rain, low_haze_snow]
+        max_clean_images: 7
+
+lightning:
+  callbacks:
+    image_logger:
+      params:
+        log_validation_every_n_epochs: 1
+        log_images_kwargs:
+          N: 1
+          ddim_steps: 30
+          ddim_eta: 0.0
+  trainer:
+    gpus: "0"
+    precision: 16
+    max_steps: -1
+    max_epochs: 5
+    accumulate_grad_batches: 128
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    benchmark: true
+    check_val_every_n_epoch: 1
+    num_sanity_val_steps: 0
+    limit_val_batches: 1

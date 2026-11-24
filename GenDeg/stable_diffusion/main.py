@@ -1,4 +1,5 @@
 import argparse, os, sys, datetime, glob, importlib, csv
+import json
 import numpy as np
 import time
 import torch
@@ -254,7 +255,7 @@ class SetupCallback(Callback):
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
 
-    def on_pretrain_routine_start(self, trainer, pl_module):
+    def on_fit_start(self, trainer, pl_module):
         if trainer.global_rank == 0:
             # Create logdirs and save configs
             os.makedirs(self.logdir, exist_ok=True)
@@ -289,14 +290,17 @@ class SetupCallback(Callback):
 class ImageLogger(Callback):
     def __init__(self, batch_frequency, max_images, clamp=True, increase_log_steps=True,
                  rescale=True, disabled=False, log_on_batch_idx=False, log_first_step=False,
-                 log_images_kwargs=None):
+                 log_images_kwargs=None, log_validation_every_n_epochs=1,
+                 validation_seed=23):
         super().__init__()
         self.rescale = rescale
         self.batch_freq = batch_frequency
         self.max_images = max_images
-        self.logger_log_images = {
-            pl.loggers.TestTubeLogger: self._testtube,
-        }
+        self.logger_log_images = {}
+        # TestTubeLogger no longer exists in current Lightning. Local image
+        # logging below remains available with CSVLogger.
+        if hasattr(pl.loggers, "TestTubeLogger"):
+            self.logger_log_images[pl.loggers.TestTubeLogger] = self._testtube
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
@@ -305,6 +309,8 @@ class ImageLogger(Callback):
         self.log_on_batch_idx = log_on_batch_idx
         self.log_images_kwargs = log_images_kwargs if log_images_kwargs else {}
         self.log_first_step = log_first_step
+        self.log_validation_every_n_epochs = log_validation_every_n_epochs
+        self.validation_seed = validation_seed
 
     @rank_zero_only
     def _testtube(self, pl_module, images, batch_idx, split):
@@ -337,9 +343,79 @@ class ImageLogger(Callback):
             os.makedirs(os.path.split(path)[0], exist_ok=True)
             Image.fromarray(grid).save(path)
 
-    def log_img(self, pl_module, batch, batch_idx, split="train"):
+    @rank_zero_only
+    def log_validation_metrics(self, save_dir, images, batch, global_step, current_epoch):
+        """Append paired fidelity/structure metrics for each epoch preview."""
+        required = {"inputs", "reals", "samples"}
+        if not required.issubset(images):
+            return
+        import cv2
+        from skimage.metrics import structural_similarity
+
+        reference = images["inputs"].detach().float().cpu().clamp(-1, 1)
+        clean = images["reals"].detach().float().cpu().clamp(-1, 1)
+        generated = images["samples"].detach().float().cpu().clamp(-1, 1)
+        count = min(reference.shape[0], clean.shape[0], generated.shape[0])
+        categories = batch.get("category", ["unknown"] * count)
+        rows = []
+        for index in range(count):
+            ref = reference[index].permute(1, 2, 0).numpy()
+            src = clean[index].permute(1, 2, 0).numpy()
+            pred = generated[index].permute(1, 2, 0).numpy()
+
+            def edge_values(image):
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+                dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+                return np.sqrt(dx * dx + dy * dy).reshape(-1)
+
+            pred_edge, clean_edge = edge_values(pred), edge_values(src)
+            edge_corr = (
+                float(np.corrcoef(pred_edge, clean_edge)[0, 1])
+                if pred_edge.std() and clean_edge.std()
+                else 0.0
+            )
+            change = np.abs(ref - src).mean(axis=2)
+            unchanged = change < 0.08  # 0.04 in [0,1], tensors are [-1,1]
+            rows.append(
+                {
+                    "category": str(categories[index]),
+                    "reference_mae": float(np.abs(pred - ref).mean() / 2.0),
+                    "reference_ssim": float(
+                        structural_similarity(ref, pred, channel_axis=2, data_range=2.0)
+                    ),
+                    "clean_edge_correlation": edge_corr,
+                    "unchanged_region_preservation_mae": (
+                        float(np.abs(pred - src)[unchanged].mean() / 2.0)
+                        if unchanged.any()
+                        else None
+                    ),
+                }
+            )
+        numeric_keys = (
+            "reference_mae",
+            "reference_ssim",
+            "clean_edge_correlation",
+            "unchanged_region_preservation_mae",
+        )
+        mean = {
+            key: float(np.mean([row[key] for row in rows if row[key] is not None]))
+            for key in numeric_keys
+        }
+        record = {
+            "epoch": int(current_epoch) + 1,
+            "global_step": int(global_step),
+            "mean": mean,
+            "per_category": rows,
+        }
+        metric_dir = os.path.join(save_dir, "metrics")
+        os.makedirs(metric_dir, exist_ok=True)
+        with open(os.path.join(metric_dir, "epoch_metrics.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def log_img(self, pl_module, batch, batch_idx, split="train", force=False):
         check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
-        if (self.check_frequency(check_idx) and  # batch_idx % self.batch_freq == 0
+        if ((force or self.check_frequency(check_idx)) and
                 hasattr(pl_module, "log_images") and
                 callable(pl_module.log_images) and
                 self.max_images > 0):
@@ -349,7 +425,14 @@ class ImageLogger(Callback):
             if is_train:
                 pl_module.eval()
 
-            with torch.no_grad():
+            # Use identical validation noise each epoch so changes in the
+            # generated images reflect model progress instead of RNG changes.
+            cuda_devices = []
+            if split == "val" and pl_module.device.type == "cuda":
+                cuda_devices = [pl_module.device.index]
+            with torch.no_grad(), torch.random.fork_rng(devices=cuda_devices):
+                if split == "val" and self.validation_seed is not None:
+                    torch.manual_seed(self.validation_seed)
                 images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
 
             for k in images:
@@ -359,6 +442,15 @@ class ImageLogger(Callback):
                     images[k] = images[k].detach().cpu()
                     if self.clamp:
                         images[k] = torch.clamp(images[k], -1., 1.)
+
+            if split == "val":
+                self.log_validation_metrics(
+                    pl_module.logger.save_dir,
+                    images,
+                    batch,
+                    pl_module.global_step,
+                    pl_module.current_epoch,
+                )
 
             self.log_local(pl_module.logger.save_dir, split, images,
                            pl_module.global_step, pl_module.current_epoch, batch_idx)
@@ -380,13 +472,35 @@ class ImageLogger(Callback):
             return True
         return False
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_train_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
+    ):
         if not self.disabled and (pl_module.global_step > 0 or self.log_first_step):
             self.log_img(pl_module, batch, batch_idx, split="train")
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
-        if not self.disabled and pl_module.global_step > 0:
-            self.log_img(pl_module, batch, batch_idx, split="val")
+    def on_validation_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
+    ):
+        should_log_epoch = (
+            self.log_validation_every_n_epochs > 0
+            and (pl_module.current_epoch + 1) % self.log_validation_every_n_epochs == 0
+        )
+        if (not self.disabled and not trainer.sanity_checking
+                and trainer.is_global_zero and batch_idx == 0 and should_log_epoch):
+            # A qualitative preview must never terminate a multi-day training
+            # run. Keep the traceback in the training log, release temporary
+            # sampling allocations, and let the next epoch continue.
+            try:
+                self.log_img(pl_module, batch, batch_idx, split="val", force=True)
+            except Exception:
+                import traceback
+                print("Epoch preview failed; continuing training.")
+                traceback.print_exc()
+            finally:
+                # Sampling can leave a large CUDA cache behind. Release it
+                # before the next training epoch shares this physical GPU.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         if hasattr(pl_module, 'calibrate_grad_norm'):
             if (pl_module.calibrate_grad_norm and batch_idx % 25 == 0) and batch_idx > 0:
                 self.log_gradients(trainer, pl_module, batch_idx=batch_idx)
@@ -396,18 +510,20 @@ class CUDACallback(Callback):
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
     def on_train_epoch_start(self, trainer, pl_module):
         # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
-        torch.cuda.synchronize(trainer.root_gpu)
+        device = trainer.strategy.root_device
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
         self.start_time = time.time()
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
-        torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+    def on_train_epoch_end(self, trainer, pl_module):
+        device = trainer.strategy.root_device
+        torch.cuda.synchronize(device)
+        max_memory = torch.cuda.max_memory_allocated(device) / 2 ** 20
         epoch_time = time.time() - self.start_time
 
         try:
-            max_memory = trainer.training_type_plugin.reduce(max_memory)
-            epoch_time = trainer.training_type_plugin.reduce(epoch_time)
+            max_memory = trainer.strategy.reduce(max_memory)
+            epoch_time = trainer.strategy.reduce(epoch_time)
 
             rank_zero_info(f"Average Epoch time: {epoch_time:.2f} seconds")
             rank_zero_info(f"Average Peak memory {max_memory:.2f}MiB")
@@ -517,16 +633,20 @@ if __name__ == "__main__":
         lightning_config = config.pop("lightning", OmegaConf.create())
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
-        # default to ddp
-        trainer_config["accelerator"] = "ddp"
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
         if not "gpus" in trainer_config:
-            del trainer_config["accelerator"]
             cpu = True
         else:
             gpuinfo = trainer_config["gpus"]
             print(f"Running on GPUs {gpuinfo}")
+            # In Lightning >=1.7, ``accelerator`` selects hardware and DDP is
+            # a strategy. The original Stable Diffusion launcher used the old
+            # ``accelerator='ddp'`` spelling.
+            trainer_config["accelerator"] = "gpu"
+            gpu_ids = [part for part in str(gpuinfo).split(",") if part.strip()]
+            if len(gpu_ids) > 1:
+                trainer_config["strategy"] = "ddp"
             cpu = False
         trainer_opt = argparse.Namespace(**trainer_config)
         lightning_config.trainer = trainer_config
@@ -549,7 +669,10 @@ if __name__ == "__main__":
                 }
             },
             "testtube": {
-                "target": "pytorch_lightning.loggers.TestTubeLogger",
+                # TestTubeLogger was removed from modern Lightning releases.
+                # CSVLogger preserves the local, dependency-free logging
+                # behavior expected by the original training script.
+                "target": "pytorch_lightning.loggers.CSVLogger",
                 "params": {
                     "name": "testtube",
                     "save_dir": logdir,

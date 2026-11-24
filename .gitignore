@@ -1,0 +1,26 @@
+# Local Python environments and caches
+.conda/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Training/evaluation datasets and generated artifacts
+GenDeg/data/
+GenDeg/logs/
+GenDeg/results/
+GenDeg/NAFNet/experiments/
+
+# External repositories and locally downloaded assets
+GenDeg/external/
+GenDeg/presentations/*.pptx
+GenDeg/presentations/*.pdf
+
+# Model weights are distributed separately through a GitHub Release
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+
+# Runtime files
+*.log
+wandb/
