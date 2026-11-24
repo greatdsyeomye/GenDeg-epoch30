@@ -18,6 +18,22 @@ The checkpoint is intentionally not committed to Git because it is about
 14 GB. Download the split assets from the GitHub Release, concatenate them in
 lexicographic order, and verify the supplied SHA-256 checksum.
 
+```bash
+gh release download epoch30-global-pooled \
+  --repo greatdsyeomye/GenDeg-epoch30 \
+  --pattern 'epoch-epoch.000029.ckpt.part-*' \
+  --pattern SHA256SUMS
+
+cat epoch-epoch.000029.ckpt.part-* > 'epoch-epoch=000029.ckpt'
+sha256sum -c SHA256SUMS
+```
+
+Expected SHA-256:
+
+```text
+23514f3b178a2b501e3c505c05a3889b1a38e5c8fb51bf6fc09e38a7f6272d38
+```
+
 ## Conditioning pipeline
 
 The model retains the original GenDeg global-statistics path and adds a
